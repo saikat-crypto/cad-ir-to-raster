@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cad-ir-to-raster"
+version = "1.0.0"
+description = "High-fidelity raster image compiler converting La Vinci Intermediate Representation (IR v3) into pixel-perfect PNG, JPEG, and WebP images."
+readme = "README.md"
+authors = [{ name = "Saikat Dutta Chowdhury", email = "saikat@rine.studio" }]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "pymupdf>=1.20.0",
+    "Pillow>=9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+cad-ir-to-raster = "cad_ir_to_raster.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
