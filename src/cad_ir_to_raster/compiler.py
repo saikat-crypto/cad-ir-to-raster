@@ -4,6 +4,8 @@ compiler.py - Core IR-to-Raster compilation engine for cad-ir-to-raster.
 Pipeline (all in-memory, zero mandatory disk I/O):
   LAVINCI_CAD_IR_V3 -> cad_ir_to_svg_string() -> SVG bytes
   -> PyMuPDF.open(stream=svg) -> Pixmap at target DPI
+  -> [Optional] Tight-crop to actual linework bounding box (Option B)
+  -> [Optional] max_dimension proportional downscale
   -> encode to PNG / JPEG / WebP bytes
   -> write to file OR return raw bytes (headless API / Lambda mode)
 """
@@ -34,9 +36,10 @@ except ImportError as e:
         "PyMuPDF is required. Install: pip install pymupdf>=1.20.0"
     ) from e
 
-# Dependency: Pillow (for WebP)
+# Dependency: Pillow
 try:
     from PIL import Image as PilImage
+    from PIL import ImageChops
     _PILLOW_AVAILABLE = True
 except ImportError:
     _PILLOW_AVAILABLE = False
@@ -98,6 +101,81 @@ def _resolve_svg_preset_name(raster_preset: RasterPreset) -> str:
     return "web-interactive-light"
 
 
+def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Converts a #RRGGBB hex string to an (R, G, B) tuple."""
+    hex_color = hex_color.strip().lstrip("#")
+    if len(hex_color) == 3:
+        hex_color = "".join(c * 2 for c in hex_color)
+    return (
+        int(hex_color[0:2], 16),
+        int(hex_color[2:4], 16),
+        int(hex_color[4:6], 16),
+    )
+
+
+def _tight_crop_image(pix: Any, preset: RasterPreset) -> Tuple[Any, bool]:
+    """
+    Auto-fits the rendered Pixmap by cropping to the bounding box of actual
+    non-background pixels, then adding a small configurable margin.
+
+    This eliminates dead whitespace caused by:
+    - Coordinate origin offsets (drawing placed far from 0,0)
+    - Portrait canvas used for landscape drawings
+    - Title block boundaries included in coordinate extents
+
+    Returns (cropped_pixmap, crop_was_applied: bool).
+    If the bounding box cannot be found (e.g. entirely blank image), the
+    original pixmap is returned unchanged and crop_was_applied=False.
+    """
+    if not _PILLOW_AVAILABLE:
+        return pix, False
+
+    try:
+        # Convert pixmap to PIL RGB image
+        png_bytes = pix.tobytes("png")
+        img = PilImage.open(io.BytesIO(png_bytes)).convert("RGB")
+
+        # Build a solid background image of the same size
+        bg_rgb = _hex_to_rgb(preset.background_color)
+        bg_img = PilImage.new("RGB", img.size, bg_rgb)
+
+        # Difference between image and background: non-zero pixels = linework
+        diff = ImageChops.difference(img, bg_img)
+
+        # Find bounding box of non-background content
+        bbox = diff.getbbox()
+        if bbox is None:
+            # Entirely blank image — nothing to crop
+            return pix, False
+
+        # Add margin around the found bounding box
+        margin_px = int(max(img.width, img.height) * preset.tight_crop_margin_percent)
+        margin_px = max(margin_px, 4)  # minimum 4px margin always
+        x0 = max(0, bbox[0] - margin_px)
+        y0 = max(0, bbox[1] - margin_px)
+        x1 = min(img.width, bbox[2] + margin_px)
+        y1 = min(img.height, bbox[3] + margin_px)
+
+        # Sanity check: don't crop if bbox is effectively the whole image
+        content_ratio = ((x1 - x0) * (y1 - y0)) / (img.width * img.height)
+        if content_ratio > 0.95:
+            return pix, False  # Already fills the canvas — skip crop
+
+        # Crop the PIL image
+        cropped_img = img.crop((x0, y0, x1, y1))
+
+        # Convert back to PyMuPDF Pixmap via PNG bytes
+        buf = io.BytesIO()
+        cropped_img.save(buf, format="PNG")
+        doc = pymupdf.open(stream=buf.getvalue(), filetype="png")
+        cropped_pix = doc[0].get_pixmap()
+        return cropped_pix, True
+
+    except Exception:
+        # Never crash: fall back to original pixmap on any error
+        return pix, False
+
+
 def _encode_pixmap(pix: Any, fmt: str, preset: RasterPreset) -> bytes:
     """Encodes a PyMuPDF Pixmap to the requested format as bytes."""
     fmt = fmt.lower()
@@ -128,7 +206,7 @@ def _apply_max_dimension(pix: Any, max_dim: Optional[int]) -> Any:
     if w <= max_dim and h <= max_dim:
         return pix
     if not _PILLOW_AVAILABLE:
-        return pix  # skip silently
+        return pix
     scale = max_dim / max(w, h)
     new_w = max(1, round(w * scale))
     new_h = max(1, round(h * scale))
@@ -168,6 +246,7 @@ def compile_ir_to_raster(
     preset: Optional[Union[RasterPreset, str]] = None,
     format: Optional[str] = None,
     dpi: Optional[int] = None,
+    tight_crop: Optional[bool] = None,
     return_report: bool = False,
 ) -> Union[Path, bytes, Tuple[Union[Path, bytes], RasterReport]]:
     """
@@ -186,6 +265,9 @@ def compile_ir_to_raster(
         Override format ("png", "jpeg", "webp"). Overrides preset format if set.
     dpi : int | None
         Override DPI. Overrides preset DPI if set.
+    tight_crop : bool | None
+        Override tight_crop flag. If True, crops to actual linework bounding box.
+        If None, uses the preset's tight_crop setting (default: True).
     return_report : bool
         If True, returns (output, RasterReport) tuple. Default: False.
 
@@ -201,7 +283,8 @@ def compile_ir_to_raster(
 
     # Resolve active preset (with per-call overrides)
     active_preset = _resolve_preset(preset)
-    if format is not None or dpi is not None:
+    has_override = format is not None or dpi is not None or tight_crop is not None
+    if has_override:
         active_preset = RasterPreset(
             name=active_preset.name,
             format=format if format is not None else active_preset.format,
@@ -212,6 +295,8 @@ def compile_ir_to_raster(
             max_dimension=active_preset.max_dimension,
             jpeg_quality=active_preset.jpeg_quality,
             webp_quality=active_preset.webp_quality,
+            tight_crop=tight_crop if tight_crop is not None else active_preset.tight_crop,
+            tight_crop_margin_percent=active_preset.tight_crop_margin_percent,
         )
 
     report.preset_name = active_preset.name
@@ -233,7 +318,7 @@ def compile_ir_to_raster(
             "height": ext.get("height", 0.0),
         }
 
-    # Stage 1: Compile IR to in-memory SVG (via cad-ir-to-svg engine)
+    # Stage 1: Compile IR -> in-memory SVG (via cad-ir-to-svg engine)
     svg_preset_name = _resolve_svg_preset_name(active_preset)
     svg_preset = SVG_PRESETS.get(svg_preset_name, SVG_DEFAULT_PRESET)
     svg_str, svg_report = compile_ir_to_svg_string(ir, preset=svg_preset)
@@ -245,10 +330,16 @@ def compile_ir_to_raster(
     pix = mupdf_doc[0].get_pixmap(dpi=active_preset.dpi)
     mupdf_doc.close()
 
-    # Stage 3: Apply max_dimension cap
+    # Stage 3: Tight-crop to actual linework bounding box (Option B / Auto-Fit)
+    crop_applied = False
+    if active_preset.tight_crop:
+        pix, crop_applied = _tight_crop_image(pix, active_preset)
+    report.tight_crop_applied = crop_applied
+
+    # Stage 4: Apply max_dimension cap (proportional downscale)
     pix = _apply_max_dimension(pix, active_preset.max_dimension)
 
-    # Stage 4: Encode to target format bytes
+    # Stage 5: Encode to target format bytes
     image_bytes = _encode_pixmap(pix, active_preset.normalized_format, active_preset)
 
     # Populate report
@@ -292,6 +383,8 @@ def get_raster_dimensions(
             color_mode=active_preset.color_mode,
             padding_percent=active_preset.padding_percent,
             max_dimension=active_preset.max_dimension,
+            tight_crop=active_preset.tight_crop,
+            tight_crop_margin_percent=active_preset.tight_crop_margin_percent,
         )
     ir = _load_ir_dict(ir_source)
     svg_preset_name = _resolve_svg_preset_name(active_preset)
@@ -300,6 +393,8 @@ def get_raster_dimensions(
     mupdf_doc = pymupdf.open(stream=svg_str.encode("utf-8"), filetype="svg")
     pix = mupdf_doc[0].get_pixmap(dpi=active_preset.dpi)
     mupdf_doc.close()
+    if active_preset.tight_crop:
+        pix, _ = _tight_crop_image(pix, active_preset)
     w, h = pix.width, pix.height
     if active_preset.max_dimension:
         scale = active_preset.max_dimension / max(w, h)
