@@ -38,6 +38,12 @@ class RasterPreset:
     tight_crop_margin_percent: float = 0.03
     # Margin as a fraction of the cropped image's larger dimension (default 3%).
 
+    # ── Adaptive Linework & Stroke Scale (Recommendation 3) ──────────────────
+    adaptive_stroke_scale: bool = True
+    # Scales stroke widths proportionally with DPI (dpi / 150.0) so lines maintain
+    # sharp, balanced presence at high resolutions (e.g., 300 DPI for AI Vision).
+    # Margin as a fraction of the cropped image's larger dimension (default 3%).
+
     def __post_init__(self):
         allowed_formats = ("png", "jpeg", "jpg", "webp")
         if self.format.lower() not in allowed_formats:
