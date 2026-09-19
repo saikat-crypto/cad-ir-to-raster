@@ -17,7 +17,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Dependency: cad-ir-to-svg
 try:
@@ -221,6 +221,46 @@ def _apply_max_dimension(pix: Any, max_dim: Optional[int]) -> Any:
     return doc[0].get_pixmap()
 
 
+
+def _filter_ir_by_layers(ir: Dict[str, Any], layers: List[str]) -> Dict[str, Any]:
+    """
+    Returns a shallow copy of the IR dict with all geometry, annotations,
+    dimensions, and components filtered to only the requested layer names.
+    Layer name matching is case-insensitive.
+
+    Unrecognised layers produce an empty drawing rather than crashing.
+    The IR structure itself (extents, metadata, layers table) is preserved intact.
+    """
+    allowed = {name.upper() for name in layers}
+
+    def _layer_match(entity: Dict[str, Any]) -> bool:
+        lyr = entity.get("layer")
+        if lyr is None:
+            return True  # No layer tag → always include
+        return str(lyr).upper() in allowed
+
+    filtered = dict(ir)
+
+    # Filter geometry_primitives
+    geom = ir.get("geometry_primitives")
+    if isinstance(geom, dict):
+        prims = geom.get("primitives", {})
+        if isinstance(prims, dict):
+            filtered_prims = {
+                key: [e for e in val if isinstance(e, dict) and _layer_match(e)]
+                for key, val in prims.items()
+                if isinstance(val, list)
+            }
+            filtered["geometry_primitives"] = {"primitives": filtered_prims}
+
+    # Filter components (block inserts), annotations, dimensions
+    for key in ("components", "annotations", "dimensions"):
+        items = ir.get(key)
+        if isinstance(items, list):
+            filtered[key] = [e for e in items if isinstance(e, dict) and _layer_match(e)]
+
+    return filtered
+
 def _count_entities(ir: Dict[str, Any]) -> int:
     """Counts total geometric + annotation entities for telemetry."""
     total = 0
@@ -248,6 +288,8 @@ def compile_ir_to_raster(
     format: Optional[str] = None,
     dpi: Optional[int] = None,
     tight_crop: Optional[bool] = None,
+    background_color: Optional[str] = None,
+    layers: Optional[List[str]] = None,
     return_report: bool = False,
 ) -> Union[Path, bytes, Tuple[Union[Path, bytes], RasterReport]]:
     """
@@ -269,6 +311,14 @@ def compile_ir_to_raster(
     tight_crop : bool | None
         Override tight_crop flag. If True, crops to actual linework bounding box.
         If None, uses the preset's tight_crop setting (default: True).
+    background_color : str | None
+        Override canvas background color (e.g. "#FFFFFF", "#0A2540", "#1E1E1E").
+        Pass "transparent" or None to use the preset's default background.
+        Threads through to the SVG renderer and tight-crop logic.
+    layers : list of str | None
+        Whitelist of layer names to include in the output (case-insensitive).
+        If None (default), all layers are rendered.
+        Example: layers=["WALLS", "DOORS"] renders only those two layers.
     return_report : bool
         If True, returns (output, RasterReport) tuple. Default: False.
 
@@ -284,13 +334,23 @@ def compile_ir_to_raster(
 
     # Resolve active preset (with per-call overrides)
     active_preset = _resolve_preset(preset)
-    has_override = format is not None or dpi is not None or tight_crop is not None
+    has_override = (
+        format is not None
+        or dpi is not None
+        or tight_crop is not None
+        or (background_color is not None and background_color.lower() != "transparent")
+    )
     if has_override:
+        resolved_bg = (
+            background_color
+            if (background_color is not None and background_color.lower() != "transparent")
+            else active_preset.background_color
+        )
         active_preset = RasterPreset(
             name=active_preset.name,
             format=format if format is not None else active_preset.format,
             dpi=dpi if dpi is not None else active_preset.dpi,
-            background_color=active_preset.background_color,
+            background_color=resolved_bg,
             color_mode=active_preset.color_mode,
             padding_percent=active_preset.padding_percent,
             max_dimension=active_preset.max_dimension,
@@ -307,6 +367,14 @@ def compile_ir_to_raster(
     # Load IR
     ir = _load_ir_dict(ir_source)
     report.total_entities_read = _count_entities(ir)
+
+    # Layer Filtering (Knob 5): isolate specific layers before rendering
+    if layers is not None and len(layers) > 0:
+        ir = _filter_ir_by_layers(ir, layers)
+        report.warnings.append(
+            f"Layer filter active — only rendering layers: {layers}. "
+            f"Entities after filter: {_count_entities(ir)}."
+        )
 
     ext = ir.get("extents")
     if isinstance(ext, dict):
@@ -334,13 +402,20 @@ def compile_ir_to_raster(
     # Stage 1: Compile IR -> in-memory SVG with Adaptive Stroke Scaling (Recommendation 3)
     svg_preset_name = _resolve_svg_preset_name(active_preset)
     base_svg_preset = SVG_PRESETS.get(svg_preset_name, SVG_DEFAULT_PRESET)
+    # Resolve SVG background: use overridden background if set, else SVG preset's native background
+    svg_bg = (
+        active_preset.background_color
+        if active_preset.background_color != _resolve_preset(preset).background_color
+           or background_color is not None
+        else base_svg_preset.background_color
+    )
     if active_preset.adaptive_stroke_scale and active_preset.dpi > 150:
         # Scale stroke-width proportionally with DPI so linework remains crisp and legible in AI Vision
         stroke_factor = active_preset.dpi / 150.0
         svg_preset = SvgPreset(
             name=base_svg_preset.name,
             description=base_svg_preset.description,
-            background_color=base_svg_preset.background_color,
+            background_color=svg_bg,
             default_stroke_color=base_svg_preset.default_stroke_color,
             default_stroke_width=round(base_svg_preset.default_stroke_width * stroke_factor, 2),
             non_scaling_stroke=base_svg_preset.non_scaling_stroke,
@@ -354,7 +429,26 @@ def compile_ir_to_raster(
             outlier_pruning=base_svg_preset.outlier_pruning,
         )
     else:
-        svg_preset = base_svg_preset
+        # Still apply background_color override even without stroke scaling
+        if svg_bg != base_svg_preset.background_color:
+            svg_preset = SvgPreset(
+                name=base_svg_preset.name,
+                description=base_svg_preset.description,
+                background_color=svg_bg,
+                default_stroke_color=base_svg_preset.default_stroke_color,
+                default_stroke_width=base_svg_preset.default_stroke_width,
+                non_scaling_stroke=base_svg_preset.non_scaling_stroke,
+                group_by_layer=base_svg_preset.group_by_layer,
+                invert_y=base_svg_preset.invert_y,
+                padding_ratio=base_svg_preset.padding_ratio,
+                target_space=base_svg_preset.target_space,
+                include_dimensions=base_svg_preset.include_dimensions,
+                include_annotations=base_svg_preset.include_annotations,
+                color_mode=base_svg_preset.color_mode,
+                outlier_pruning=base_svg_preset.outlier_pruning,
+            )
+        else:
+            svg_preset = base_svg_preset
 
     svg_str, svg_report = compile_ir_to_svg_string(ir, preset=svg_preset)
     report.total_entities_rendered = svg_report.total_entities_rendered
