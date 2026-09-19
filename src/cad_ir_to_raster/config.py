@@ -7,8 +7,13 @@ Additional presets are scaffolded as stubs for future API milestones.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
+import re
+
+from .exceptions import InvalidFormatError, InvalidDpiError, InvalidColorError
+
+_HEX_COLOR_RE = re.compile(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 
 
 @dataclass(frozen=True)
@@ -18,16 +23,25 @@ class RasterPreset:
 
     All parameters are frozen at preset creation time.
     API callers can build custom presets by constructing a new RasterPreset instance.
+
+    Raises
+    ------
+    InvalidFormatError
+        If `format` is not one of 'png', 'jpeg', 'jpg', 'webp'.
+    InvalidDpiError
+        If `dpi` is outside the valid range [1, 1200].
+    InvalidColorError
+        If `background_color` is not a valid #RRGGBB or #RGB hex string.
     """
     name: str = "web-preview"
-    format: str = "png"              # "png", "jpeg", "webp"
-    dpi: int = 150                   # Resolution: dots per inch
-    background_color: str = "#FFFFFF"  # Canvas background (hex #RRGGBB)
-    color_mode: str = "contrast-safe"  # "contrast-safe" | "monochrome" | "aci"
-    padding_percent: float = 0.02    # Padding as fraction of drawing dimension
+    format: str = "png"                  # "png", "jpeg", "webp"
+    dpi: int = 150                       # Resolution: dots per inch
+    background_color: str = "#FFFFFF"    # Canvas background (hex #RRGGBB)
+    color_mode: str = "contrast-safe"    # "contrast-safe" | "monochrome" | "aci"
+    padding_percent: float = 0.02        # Padding as fraction of drawing dimension
     max_dimension: Optional[int] = None  # Cap max pixel width or height (None = uncapped)
-    jpeg_quality: int = 92           # JPEG quality 1-100 (only applies when format="jpeg")
-    webp_quality: int = 85           # WebP quality 1-100 (only applies when format="webp")
+    jpeg_quality: int = 92               # JPEG quality 1-100 (only applies when format="jpeg")
+    webp_quality: int = 85               # WebP quality 1-100 (only applies when format="webp")
 
     # ── Tight-Crop (Option B / Auto-Fit) ─────────────────────────────────────
     tight_crop: bool = True
@@ -42,17 +56,22 @@ class RasterPreset:
     adaptive_stroke_scale: bool = True
     # Scales stroke widths proportionally with DPI (dpi / 150.0) so lines maintain
     # sharp, balanced presence at high resolutions (e.g., 300 DPI for AI Vision).
-    # Margin as a fraction of the cropped image's larger dimension (default 3%).
 
     def __post_init__(self):
+        # Validate format
         allowed_formats = ("png", "jpeg", "jpg", "webp")
         if self.format.lower() not in allowed_formats:
-            raise ValueError(
-                f"Unsupported raster format '{self.format}'. "
-                f"Must be one of: {allowed_formats}"
-            )
-        if self.dpi < 1 or self.dpi > 1200:
-            raise ValueError(f"DPI must be between 1 and 1200. Got: {self.dpi}")
+            raise InvalidFormatError(self.format)
+
+        # Validate DPI
+        if self.dpi < InvalidDpiError.MIN_DPI or self.dpi > InvalidDpiError.MAX_DPI:
+            raise InvalidDpiError(self.dpi)
+
+        # Validate background_color hex
+        bg = self.background_color
+        if bg and bg.lower() not in ("transparent", "none"):
+            if not _HEX_COLOR_RE.match(bg):
+                raise InvalidColorError(bg, "background_color")
 
     @property
     def normalized_format(self) -> str:

@@ -46,6 +46,15 @@ except ImportError:
     _PILLOW_AVAILABLE = False
 
 from .config import DEFAULT_PRESET, PRESETS, RasterPreset
+from .exceptions import (
+    CadRasterError,
+    InvalidPresetError,
+    InvalidFormatError,
+    InvalidDpiError,
+    InvalidColorError,
+    InvalidIrPayloadError,
+    InvalidLayerError,
+)
 from .telemetry import RasterReport
 
 
@@ -53,6 +62,8 @@ from .telemetry import RasterReport
 
 def _load_ir_dict(ir_source: Union[str, Path, Dict[str, Any], Any]) -> Dict[str, Any]:
     """Converts any supported IR source into a plain Python dict."""
+    if ir_source is None:
+        raise InvalidIrPayloadError(type(None), "Received None. Did you forget to pass the IR?")
     if isinstance(ir_source, dict):
         return ir_source
     if hasattr(ir_source, "model_dump"):
@@ -64,16 +75,25 @@ def _load_ir_dict(ir_source: Union[str, Path, Dict[str, Any], Any]) -> Dict[str,
         if s.startswith("{"):
             try:
                 return json.loads(s)
-            except Exception:
-                pass
+            except json.JSONDecodeError as exc:
+                raise InvalidIrPayloadError(
+                    str, f"JSON parse error at position {exc.pos}: {exc.msg}"
+                ) from exc
         p = Path(ir_source)
         if p.is_file():
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
-    raise ValueError(
-        f"Cannot parse CAD IR payload from source type {type(ir_source)}. "
-        "Expected: dict, Path to JSON file, or raw JSON string."
-    )
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except json.JSONDecodeError as exc:
+                raise InvalidIrPayloadError(
+                    Path, f"JSON parse error in '{p.name}' at line {exc.lineno}: {exc.msg}"
+                ) from exc
+        if not p.exists():
+            raise InvalidIrPayloadError(
+                Path,
+                f"File not found: '{p}'. Check the path and ensure the file exists."
+            )
+    raise InvalidIrPayloadError(type(ir_source))
 
 
 def _resolve_preset(preset: Optional[Union[RasterPreset, str]]) -> RasterPreset:
@@ -83,12 +103,20 @@ def _resolve_preset(preset: Optional[Union[RasterPreset, str]]) -> RasterPreset:
     if isinstance(preset, RasterPreset):
         return preset
     if isinstance(preset, str):
-        if preset not in PRESETS:
-            raise ValueError(
-                f"Unknown preset: '{preset}'. Available: {list(PRESETS.keys())}"
-            )
-        return PRESETS[preset]
-    raise TypeError(f"preset must be RasterPreset or str, got {type(preset)}")
+        if preset in PRESETS:
+            return PRESETS[preset]
+        # Fuzzy "did you mean?" using common transformations
+        suggestion = None
+        normalized = preset.lower().replace("_", "-").strip()
+        if normalized in PRESETS:
+            suggestion = normalized
+        else:
+            for name in PRESETS:
+                if name.startswith(normalized[:4]) or normalized.startswith(name[:4]):
+                    suggestion = name
+                    break
+        raise InvalidPresetError(preset, list(PRESETS.keys()), suggestion)
+    raise InvalidPresetError(str(preset), list(PRESETS.keys()))
 
 
 def _resolve_svg_preset_name(raster_preset: RasterPreset) -> str:
@@ -331,6 +359,20 @@ def compile_ir_to_raster(
     """
     t0 = time.perf_counter()
     report = RasterReport()
+
+    # ── Input Validation (developer-facing, fail-fast before any expensive work) ───
+    if format is not None and format.lower() not in ("png", "jpeg", "jpg", "webp"):
+        raise InvalidFormatError(format)
+    if dpi is not None and (dpi < InvalidDpiError.MIN_DPI or dpi > InvalidDpiError.MAX_DPI):
+        raise InvalidDpiError(dpi)
+    if background_color is not None and background_color.lower() not in ("transparent", "none"):
+        import re as _re
+        if not _re.match(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$", background_color):
+            raise InvalidColorError(background_color)
+    if layers is not None and not isinstance(layers, list):
+        raise InvalidLayerError(layers)
+    if isinstance(layers, list) and not all(isinstance(l, str) for l in layers):
+        raise InvalidLayerError(layers)
 
     # Resolve active preset (with per-call overrides)
     active_preset = _resolve_preset(preset)
